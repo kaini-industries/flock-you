@@ -304,94 +304,130 @@ static M5Canvas fyCanvas(&M5Cardputer.Display);
 static unsigned long fyLastDisplayUpdate = 0;
 static int fyDisplayScroll = 0;
 #define FY_DISPLAY_INTERVAL 500
+#define FY_ROWS_PER_PAGE 5
+
+static int fyRSSIBars(int rssi) {
+    if (rssi > -40) return 5;
+    if (rssi > -55) return 4;
+    if (rssi > -65) return 3;
+    if (rssi > -75) return 2;
+    return 1;
+}
+
+static uint16_t fyRSSIColor(int rssi) {
+    if (rssi > -50) return TFT_GREEN;
+    if (rssi > -70) return TFT_YELLOW;
+    return TFT_RED;
+}
 
 static void fyUpdateDisplay() {
     fyCanvas.fillSprite(TFT_BLACK);
 
-    // Header bar
-    fyCanvas.setTextSize(1);
-    fyCanvas.setTextColor(TFT_MAGENTA);
-    fyCanvas.setCursor(2, 4);
-    fyCanvas.print("FLOCK-YOU");
-
-    // Battery level
-    int batt = M5Cardputer.Power.getBatteryLevel();
-    fyCanvas.setCursor(70, 4);
-    fyCanvas.setTextColor(batt > 20 ? TFT_GREEN : TFT_RED);
-    fyCanvas.printf("B:%d%%", batt);
-
-    // WiFi status
-    fyCanvas.setCursor(120, 4);
-    fyCanvas.setTextColor(WiFi.getMode() == WIFI_AP ? TFT_GREEN : TFT_DARKGREY);
-    fyCanvas.print("WiFi:AP");
-
-    // GPS status
-    fyCanvas.setCursor(180, 4);
-    fyCanvas.setTextColor(fyGPSIsFresh() ? TFT_GREEN : TFT_DARKGREY);
-    fyCanvas.printf("GPS:%s", fyGPSIsFresh() ? "OK" : "--");
-
-    // Mute indicator
-    if (!fyBuzzerOn) {
-        fyCanvas.setCursor(218, 4);
-        fyCanvas.setTextColor(TFT_RED);
-        fyCanvas.print("M");
-    }
-
-    // Divider
-    fyCanvas.drawFastHLine(0, 15, 240, TFT_MAGENTA);
-
-    // Stats bar
+    // --- Hero bar (y=0..23) ---
     int ravenCount = 0;
     if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         for (int i = 0; i < fyDetCount; i++) {
             if (fyDet[i].isRaven) ravenCount++;
         }
 
+        // Detection count (big)
+        fyCanvas.setTextSize(2);
         fyCanvas.setTextColor(TFT_WHITE);
-        fyCanvas.setCursor(2, 19);
-        fyCanvas.printf("Detections: %d   Ravens: %d", fyDetCount, ravenCount);
+        fyCanvas.setCursor(2, 4);
+        fyCanvas.printf("%d", fyDetCount);
+        fyCanvas.setTextSize(1);
+        int labelX = fyDetCount >= 100 ? 38 : (fyDetCount >= 10 ? 26 : 14);
+        fyCanvas.setCursor(labelX, 10);
+        fyCanvas.setTextColor(TFT_MAGENTA);
+        fyCanvas.print("FOUND");
 
-        // Divider
-        fyCanvas.drawFastHLine(0, 30, 240, 0x4208);
-
-        // Detection list (most recent first)
-        int y = 34;
-        int maxRows = 6;
-        int shown = 0;
-        for (int i = fyDetCount - 1 - fyDisplayScroll;
-             i >= 0 && shown < maxRows; i--, shown++) {
-            FYDetection& d = fyDet[i];
-
-            // MAC (first 11 chars: xx:xx:xx:xx)
-            fyCanvas.setTextColor(d.isRaven ? TFT_RED : TFT_MAGENTA);
-            fyCanvas.setCursor(0, y);
-            fyCanvas.printf("%.11s", d.mac);
-
-            // RSSI
-            fyCanvas.setTextColor(TFT_CYAN);
-            fyCanvas.setCursor(72, y);
-            fyCanvas.printf("%d", d.rssi);
-
-            // Count
-            fyCanvas.setTextColor(TFT_YELLOW);
-            fyCanvas.setCursor(104, y);
-            fyCanvas.printf("x%d", d.count);
-
-            // Method or Raven FW
-            fyCanvas.setTextColor(TFT_WHITE);
-            fyCanvas.setCursor(136, y);
-            if (d.isRaven) {
-                fyCanvas.printf("RAVEN %s", d.ravenFW);
-            } else {
-                fyCanvas.printf("%.16s", d.method);
-            }
-            y += 16;
+        // Raven count (only if > 0)
+        if (ravenCount > 0) {
+            fyCanvas.setTextSize(2);
+            fyCanvas.setTextColor(TFT_RED);
+            fyCanvas.setCursor(70, 4);
+            fyCanvas.printf("%d", ravenCount);
+            fyCanvas.setTextSize(1);
+            fyCanvas.setCursor(ravenCount >= 10 ? 94 : 82, 10);
+            fyCanvas.print("RAVEN");
         }
 
-        if (fyDetCount == 0) {
-            fyCanvas.setTextColor(0x4208);
-            fyCanvas.setCursor(70, 70);
+        // Right side status (textSize 1)
+        int batt = M5Cardputer.Power.getBatteryLevel();
+        fyCanvas.setTextColor(batt > 20 ? TFT_GREEN : TFT_RED);
+        fyCanvas.setCursor(150, 4);
+        fyCanvas.printf("B:%d%%", batt);
+
+        fyCanvas.setCursor(200, 4);
+        fyCanvas.setTextColor(fyGPSIsFresh() ? TFT_GREEN : 0x4208);
+        fyCanvas.print("GPS");
+
+        if (!fyBuzzerOn) {
+            fyCanvas.setCursor(228, 4);
+            fyCanvas.setTextColor(TFT_RED);
+            fyCanvas.print("M");
+        }
+
+        // Divider
+        fyCanvas.drawFastHLine(0, 24, 240, TFT_MAGENTA);
+
+        // --- Detection rows (y=26, 5 rows x 20px = 100px) ---
+        if (fyDetCount > 0) {
+            int y = 26;
+            int shown = 0;
+            int startIdx = fyDetCount - 1 - (fyDisplayScroll * FY_ROWS_PER_PAGE);
+
+            for (int i = startIdx; i >= 0 && shown < FY_ROWS_PER_PAGE; i--, shown++) {
+                FYDetection& d = fyDet[i];
+
+                // MAC (first 11 chars)
+                fyCanvas.setTextSize(1);
+                fyCanvas.setTextColor(d.isRaven ? TFT_RED : TFT_WHITE);
+                fyCanvas.setCursor(0, y + 2);
+                fyCanvas.printf("%.11s", d.mac);
+
+                // RSSI bars (visual)
+                int bars = fyRSSIBars(d.rssi);
+                uint16_t barColor = fyRSSIColor(d.rssi);
+                for (int b = 0; b < bars; b++) {
+                    fyCanvas.fillRect(72 + b * 6, y + 12 - b, 4, 4 + b, barColor);
+                }
+
+                // Count
+                fyCanvas.setTextColor(TFT_YELLOW);
+                fyCanvas.setCursor(106, y + 2);
+                fyCanvas.printf("x%d", d.count);
+
+                // Method or Raven FW
+                fyCanvas.setTextColor(d.isRaven ? TFT_RED : 0xC618);
+                fyCanvas.setCursor(134, y + 2);
+                if (d.isRaven) {
+                    fyCanvas.printf("RAVEN %s", d.ravenFW);
+                } else {
+                    fyCanvas.printf("%.16s", d.method);
+                }
+
+                y += 20;
+            }
+        } else {
+            // Empty state
+            fyCanvas.setTextSize(2);
+            fyCanvas.setTextColor(TFT_MAGENTA);
+            fyCanvas.setCursor(30, 60);
             fyCanvas.print("Scanning...");
+        }
+
+        // --- Footer (y=126) ---
+        fyCanvas.drawFastHLine(0, 125, 240, 0x4208);
+        fyCanvas.setTextSize(1);
+        fyCanvas.setTextColor(0x4208);
+        fyCanvas.setCursor(2, 127);
+        fyCanvas.print("W/S:pg  M:mute  C:clr");
+
+        int totalPages = (fyDetCount + FY_ROWS_PER_PAGE - 1) / FY_ROWS_PER_PAGE;
+        if (totalPages > 1) {
+            fyCanvas.setCursor(200, 127);
+            fyCanvas.printf("%d/%d", fyDisplayScroll + 1, totalPages);
         }
 
         xSemaphoreGive(fyMutex);
@@ -1225,14 +1261,17 @@ void setup() {
     // Splash screen while BLE/WiFi init
     auto& lcd = M5Cardputer.Display;
     lcd.fillScreen(TFT_BLACK);
-    lcd.setTextSize(2);
+    lcd.setTextSize(3);
     lcd.setTextColor(TFT_MAGENTA);
-    lcd.setCursor(40, 50);
+    lcd.setCursor(20, 30);
     lcd.print("FLOCK-YOU");
     lcd.setTextSize(1);
+    lcd.setTextColor(0x4208);
+    lcd.setCursor(60, 70);
+    lcd.print("BLE Surveillance Detector");
     lcd.setTextColor(TFT_WHITE);
-    lcd.setCursor(50, 80);
-    lcd.print("Initializing...");
+    lcd.setCursor(80, 100);
+    lcd.print("Starting...");
 
     // Create double-buffered sprite for flicker-free display
     fyCanvas.createSprite(240, 135);
@@ -1372,7 +1411,8 @@ void loop() {
                 fyLastDisplayUpdate = 0;  // force redraw
             }
             if (key == 's' || key == 'S') {
-                if (fyDisplayScroll < fyDetCount - 1) fyDisplayScroll++;
+                int maxPages = (fyDetCount + FY_ROWS_PER_PAGE - 1) / FY_ROWS_PER_PAGE;
+                if (fyDisplayScroll < maxPages - 1) fyDisplayScroll++;
                 fyLastDisplayUpdate = 0;
             }
             if (key == 'm' || key == 'M') {

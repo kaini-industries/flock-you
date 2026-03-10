@@ -13,7 +13,11 @@
 // Optional WiFi STA connection for future features
 // ============================================================================
 
-#include <Arduino.h>
+#ifdef CARDPUTER_ADV
+  #include <M5Cardputer.h>
+#else
+  #include <Arduino.h>
+#endif
 #include <WiFi.h>
 #include <NimBLEDevice.h>
 #include <NimBLEScan.h>
@@ -32,7 +36,9 @@
 // CONFIGURATION
 // ============================================================================
 
-#define BUZZER_PIN 3
+#ifndef CARDPUTER_ADV
+  #define BUZZER_PIN 3
+#endif
 
 // Audio
 #define LOW_FREQ 200
@@ -202,7 +208,11 @@ static bool fySpiffsReady = false;
 
 static void fyBeep(int freq, int dur) {
     if (!fyBuzzerOn) return;
+#ifdef CARDPUTER_ADV
+    M5Cardputer.Speaker.tone(freq, dur);
+#else
     tone(BUZZER_PIN, freq, dur);
+#endif
     delay(dur + 50);
 }
 
@@ -218,10 +228,18 @@ static void fyCaw(int startFreq, int endFreq, int durationMs, int warbleHz) {
             f += ((i % 6 < 3) ? warbleHz : -warbleHz);
         }
         if (f < 100) f = 100;
+#ifdef CARDPUTER_ADV
+        M5Cardputer.Speaker.tone(f, 10);
+#else
         tone(BUZZER_PIN, f, 10);
+#endif
         delay(8);
     }
+#ifdef CARDPUTER_ADV
+    M5Cardputer.Speaker.stop();
+#else
     noTone(BUZZER_PIN);
+#endif
 }
 
 static void fyBootBeep() {
@@ -242,9 +260,15 @@ static void fyBootBeep() {
     delay(80);
 
     // Quick staccato ending "kk-kk"
+#ifdef CARDPUTER_ADV
+    M5Cardputer.Speaker.tone(600, 25); delay(40);
+    M5Cardputer.Speaker.tone(550, 25); delay(40);
+    M5Cardputer.Speaker.stop();
+#else
     tone(BUZZER_PIN, 600, 25); delay(40);
     tone(BUZZER_PIN, 550, 25); delay(40);
     noTone(BUZZER_PIN);
+#endif
 
     printf("[FLOCK-YOU] *caw caw caw*\n");
 }
@@ -267,6 +291,115 @@ static void fyHeartbeat() {
     delay(120);
     fyCaw(480, 380, 80, 20);
 }
+
+// Forward declaration for display module
+static bool fyGPSIsFresh();
+
+// ============================================================================
+// LCD DISPLAY (Cardputer-Adv only)
+// ============================================================================
+
+#ifdef CARDPUTER_ADV
+static M5Canvas fyCanvas(&M5Cardputer.Display);
+static unsigned long fyLastDisplayUpdate = 0;
+static int fyDisplayScroll = 0;
+#define FY_DISPLAY_INTERVAL 500
+
+static void fyUpdateDisplay() {
+    fyCanvas.fillSprite(TFT_BLACK);
+
+    // Header bar
+    fyCanvas.setTextSize(1);
+    fyCanvas.setTextColor(TFT_MAGENTA);
+    fyCanvas.setCursor(2, 4);
+    fyCanvas.print("FLOCK-YOU");
+
+    // Battery level
+    int batt = M5Cardputer.Power.getBatteryLevel();
+    fyCanvas.setCursor(70, 4);
+    fyCanvas.setTextColor(batt > 20 ? TFT_GREEN : TFT_RED);
+    fyCanvas.printf("B:%d%%", batt);
+
+    // WiFi status
+    fyCanvas.setCursor(120, 4);
+    fyCanvas.setTextColor(WiFi.getMode() == WIFI_AP ? TFT_GREEN : TFT_DARKGREY);
+    fyCanvas.print("WiFi:AP");
+
+    // GPS status
+    fyCanvas.setCursor(180, 4);
+    fyCanvas.setTextColor(fyGPSIsFresh() ? TFT_GREEN : TFT_DARKGREY);
+    fyCanvas.printf("GPS:%s", fyGPSIsFresh() ? "OK" : "--");
+
+    // Mute indicator
+    if (!fyBuzzerOn) {
+        fyCanvas.setCursor(218, 4);
+        fyCanvas.setTextColor(TFT_RED);
+        fyCanvas.print("M");
+    }
+
+    // Divider
+    fyCanvas.drawFastHLine(0, 15, 240, TFT_MAGENTA);
+
+    // Stats bar
+    int ravenCount = 0;
+    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        for (int i = 0; i < fyDetCount; i++) {
+            if (fyDet[i].isRaven) ravenCount++;
+        }
+
+        fyCanvas.setTextColor(TFT_WHITE);
+        fyCanvas.setCursor(2, 19);
+        fyCanvas.printf("Detections: %d   Ravens: %d", fyDetCount, ravenCount);
+
+        // Divider
+        fyCanvas.drawFastHLine(0, 30, 240, 0x4208);
+
+        // Detection list (most recent first)
+        int y = 34;
+        int maxRows = 6;
+        int shown = 0;
+        for (int i = fyDetCount - 1 - fyDisplayScroll;
+             i >= 0 && shown < maxRows; i--, shown++) {
+            FYDetection& d = fyDet[i];
+
+            // MAC (first 11 chars: xx:xx:xx:xx)
+            fyCanvas.setTextColor(d.isRaven ? TFT_RED : TFT_MAGENTA);
+            fyCanvas.setCursor(0, y);
+            fyCanvas.printf("%.11s", d.mac);
+
+            // RSSI
+            fyCanvas.setTextColor(TFT_CYAN);
+            fyCanvas.setCursor(72, y);
+            fyCanvas.printf("%d", d.rssi);
+
+            // Count
+            fyCanvas.setTextColor(TFT_YELLOW);
+            fyCanvas.setCursor(104, y);
+            fyCanvas.printf("x%d", d.count);
+
+            // Method or Raven FW
+            fyCanvas.setTextColor(TFT_WHITE);
+            fyCanvas.setCursor(136, y);
+            if (d.isRaven) {
+                fyCanvas.printf("RAVEN %s", d.ravenFW);
+            } else {
+                fyCanvas.printf("%.16s", d.method);
+            }
+            y += 16;
+        }
+
+        if (fyDetCount == 0) {
+            fyCanvas.setTextColor(0x4208);
+            fyCanvas.setCursor(70, 70);
+            fyCanvas.print("Scanning...");
+        }
+
+        xSemaphoreGive(fyMutex);
+    }
+
+    fyCanvas.pushSprite(0, 0);
+}
+#endif // CARDPUTER_ADV
 
 // ============================================================================
 // DETECTION HELPERS
@@ -1084,14 +1217,34 @@ static void fySetupServer() {
 // ============================================================================
 
 void setup() {
+#ifdef CARDPUTER_ADV
+    auto cfg = M5.config();
+    M5Cardputer.begin(cfg);
+    M5Cardputer.Speaker.setVolume(200);
+
+    // Splash screen while BLE/WiFi init
+    auto& lcd = M5Cardputer.Display;
+    lcd.fillScreen(TFT_BLACK);
+    lcd.setTextSize(2);
+    lcd.setTextColor(TFT_MAGENTA);
+    lcd.setCursor(40, 50);
+    lcd.print("FLOCK-YOU");
+    lcd.setTextSize(1);
+    lcd.setTextColor(TFT_WHITE);
+    lcd.setCursor(50, 80);
+    lcd.print("Initializing...");
+
+    // Create double-buffered sprite for flicker-free display
+    fyCanvas.createSprite(240, 135);
+#else
     Serial.begin(115200);
     delay(500);
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+#endif
 
     // Standalone mode: buzzer always on by default
     fyBuzzerOn = true;
-
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
 
     fyMutex = xSemaphoreCreateMutex();
 
@@ -1162,6 +1315,10 @@ void setup() {
 }
 
 void loop() {
+#ifdef CARDPUTER_ADV
+    M5Cardputer.update();
+#endif
+
     // Serial host detection (heartbeat from DeFlock desktop app)
     if (Serial.available()) {
         while (Serial.available()) Serial.read();  // drain buffer
@@ -1204,6 +1361,45 @@ void loop() {
             fyTriggered = false;
         }
     }
+
+#ifdef CARDPUTER_ADV
+    // Keyboard input
+    if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+        Keyboard_Class::KeysState state = M5Cardputer.Keyboard.keysState();
+        for (auto key : state.word) {
+            if (key == 'w' || key == 'W') {
+                if (fyDisplayScroll > 0) fyDisplayScroll--;
+                fyLastDisplayUpdate = 0;  // force redraw
+            }
+            if (key == 's' || key == 'S') {
+                if (fyDisplayScroll < fyDetCount - 1) fyDisplayScroll++;
+                fyLastDisplayUpdate = 0;
+            }
+            if (key == 'm' || key == 'M') {
+                fyBuzzerOn = !fyBuzzerOn;
+                fyLastDisplayUpdate = 0;
+            }
+            if (key == 'c' || key == 'C') {
+                fySaveSession();
+                if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                    fyDetCount = 0;
+                    memset(fyDet, 0, sizeof(fyDet));
+                    fyTriggered = false;
+                    fyDeviceInRange = false;
+                    fyDisplayScroll = 0;
+                    xSemaphoreGive(fyMutex);
+                }
+                fyLastDisplayUpdate = 0;
+            }
+        }
+    }
+
+    // LCD refresh
+    if (millis() - fyLastDisplayUpdate >= FY_DISPLAY_INTERVAL) {
+        fyUpdateDisplay();
+        fyLastDisplayUpdate = millis();
+    }
+#endif
 
     // Auto-save session to SPIFFS every 15s if detections changed
     // Also triggers an early save 5s after first detection to minimize loss on power-cycle

@@ -1358,6 +1358,7 @@ void loop() {
     M5Cardputer.update();
 #endif
 
+
     // Serial host detection (heartbeat from DeFlock desktop app)
     if (Serial.available()) {
         while (Serial.available()) Serial.read();  // drain buffer

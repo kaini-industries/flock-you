@@ -303,6 +303,11 @@ static bool fyGPSIsFresh();
 static M5Canvas fyCanvas(&M5Cardputer.Display);
 static unsigned long fyLastDisplayUpdate = 0;
 static int fyDisplayScroll = 0;
+static int fyDisplayMode = 0;           // 0=list, 1=detail, 2=info
+static int fyDetailIndex = -1;          // detection index for detail view
+static unsigned long fyLastSaveFlash = 0; // timestamp for "SAVED" indicator
+static int fyLastBattWarning = 100;     // last battery level that triggered warning
+static int fySpeakerVolume = 200;       // current volume (cycle: 50→100→150→200→255)
 #define FY_DISPLAY_INTERVAL 500
 #define FY_ROWS_PER_PAGE 5
 
@@ -352,15 +357,28 @@ static void fyUpdateDisplay() {
             fyCanvas.print("RAVEN");
         }
 
+        // SAVED flash indicator
+        if (millis() - fyLastSaveFlash < 1500) {
+            fyCanvas.setTextColor(TFT_GREEN);
+            fyCanvas.setCursor(120, 4);
+            fyCanvas.print("SAVED");
+        }
+
         // Right side status (textSize 1)
         int batt = M5Cardputer.Power.getBatteryLevel();
         fyCanvas.setTextColor(batt > 20 ? TFT_GREEN : TFT_RED);
         fyCanvas.setCursor(150, 4);
         fyCanvas.printf("B:%d%%", batt);
 
-        fyCanvas.setCursor(200, 4);
-        fyCanvas.setTextColor(fyGPSIsFresh() ? TFT_GREEN : 0x4208);
-        fyCanvas.print("GPS");
+        // Companion mode or GPS indicator
+        fyCanvas.setCursor(196, 4);
+        if (fyBLEClientConnected || fySerialHostConnected) {
+            fyCanvas.setTextColor(TFT_CYAN);
+            fyCanvas.print("BLE");
+        } else {
+            fyCanvas.setTextColor(fyGPSIsFresh() ? TFT_GREEN : 0x4208);
+            fyCanvas.print("GPS");
+        }
 
         if (!fyBuzzerOn) {
             fyCanvas.setCursor(228, 4);
@@ -398,11 +416,13 @@ static void fyUpdateDisplay() {
                 fyCanvas.setCursor(106, y + 2);
                 fyCanvas.printf("x%d", d.count);
 
-                // Method or Raven FW
+                // Method/Name or Raven FW
                 fyCanvas.setTextColor(d.isRaven ? TFT_RED : 0xC618);
                 fyCanvas.setCursor(134, y + 2);
                 if (d.isRaven) {
                     fyCanvas.printf("RAVEN %s", d.ravenFW);
+                } else if (d.name[0] != '\0') {
+                    fyCanvas.printf("%.16s", d.name);
                 } else {
                     fyCanvas.printf("%.16s", d.method);
                 }
@@ -422,7 +442,7 @@ static void fyUpdateDisplay() {
         fyCanvas.setTextSize(1);
         fyCanvas.setTextColor(0x4208);
         fyCanvas.setCursor(2, 127);
-        fyCanvas.print("W/S:pg  M:mute  C:clr");
+        fyCanvas.print("W/S:pg D:detail I:info");
 
         int totalPages = (fyDetCount + FY_ROWS_PER_PAGE - 1) / FY_ROWS_PER_PAGE;
         if (totalPages > 1) {
@@ -432,6 +452,190 @@ static void fyUpdateDisplay() {
 
         xSemaphoreGive(fyMutex);
     }
+
+    fyCanvas.pushSprite(0, 0);
+}
+
+static void fyDrawDetailView() {
+    fyCanvas.fillSprite(TFT_BLACK);
+
+    if (fyDetailIndex < 0 || fyDetailIndex >= fyDetCount) {
+        fyDisplayMode = 0;
+        return;
+    }
+
+    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        FYDetection& d = fyDet[fyDetailIndex];
+        int y = 2;
+
+        // Title bar
+        fyCanvas.setTextSize(1);
+        fyCanvas.setTextColor(TFT_MAGENTA);
+        fyCanvas.setCursor(2, y);
+        fyCanvas.print("DETECTION DETAIL");
+        fyCanvas.setCursor(200, y);
+        fyCanvas.printf("[%d/%d]", fyDetailIndex + 1, fyDetCount);
+        y += 12;
+        fyCanvas.drawFastHLine(0, y, 240, TFT_MAGENTA);
+        y += 4;
+
+        // MAC
+        fyCanvas.setTextColor(d.isRaven ? TFT_RED : TFT_WHITE);
+        fyCanvas.setCursor(2, y);
+        fyCanvas.printf("MAC: %s", d.mac);
+        y += 12;
+
+        // Name
+        fyCanvas.setTextColor(d.name[0] ? TFT_CYAN : 0x4208);
+        fyCanvas.setCursor(2, y);
+        fyCanvas.printf("Name: %s", d.name[0] ? d.name : "---");
+        y += 12;
+
+        // RSSI with bars
+        uint16_t barColor = fyRSSIColor(d.rssi);
+        fyCanvas.setTextColor(barColor);
+        fyCanvas.setCursor(2, y);
+        fyCanvas.printf("RSSI: %d dBm ", d.rssi);
+        int bars = fyRSSIBars(d.rssi);
+        int bx = 90;
+        for (int b = 0; b < bars; b++) {
+            fyCanvas.fillRect(bx + b * 6, y + 6 - b, 4, 4 + b, barColor);
+        }
+        y += 12;
+
+        // Method
+        fyCanvas.setTextColor(0xC618);
+        fyCanvas.setCursor(2, y);
+        fyCanvas.printf("Method: %s", d.method);
+        y += 12;
+
+        // Count
+        fyCanvas.setTextColor(TFT_YELLOW);
+        fyCanvas.setCursor(2, y);
+        fyCanvas.printf("Count: x%d", d.count);
+        y += 12;
+
+        // Timestamps (relative)
+        unsigned long now = millis();
+        unsigned long firstAgo = (now - d.firstSeen) / 1000;
+        unsigned long lastAgo = (now - d.lastSeen) / 1000;
+        fyCanvas.setTextColor(TFT_WHITE);
+        fyCanvas.setCursor(2, y);
+        if (firstAgo >= 60)
+            fyCanvas.printf("First: %lum ago", firstAgo / 60);
+        else
+            fyCanvas.printf("First: %lus ago", firstAgo);
+        fyCanvas.setCursor(120, y);
+        if (lastAgo >= 60)
+            fyCanvas.printf("Last: %lum ago", lastAgo / 60);
+        else
+            fyCanvas.printf("Last: %lus ago", lastAgo);
+        y += 12;
+
+        // GPS
+        if (d.hasGPS) {
+            fyCanvas.setTextColor(TFT_GREEN);
+            fyCanvas.setCursor(2, y);
+            fyCanvas.printf("GPS: %.4f, %.4f +/-%.0fm", d.gpsLat, d.gpsLon, d.gpsAcc);
+        } else {
+            fyCanvas.setTextColor(0x4208);
+            fyCanvas.setCursor(2, y);
+            fyCanvas.print("GPS: No fix");
+        }
+        y += 12;
+
+        // Raven FW (only if raven)
+        if (d.isRaven) {
+            fyCanvas.setTextColor(TFT_RED);
+            fyCanvas.setCursor(2, y);
+            fyCanvas.printf("Raven FW: %s", d.ravenFW);
+        }
+
+        // Footer
+        fyCanvas.drawFastHLine(0, 125, 240, 0x4208);
+        fyCanvas.setTextColor(0x4208);
+        fyCanvas.setCursor(2, 127);
+        fyCanvas.print("W/S:prev/next  D:back");
+        fyCanvas.setCursor(200, 127);
+        fyCanvas.printf("%d/%d", fyDetailIndex + 1, fyDetCount);
+
+        xSemaphoreGive(fyMutex);
+    }
+
+    fyCanvas.pushSprite(0, 0);
+}
+
+static void fyDrawInfoView() {
+    fyCanvas.fillSprite(TFT_BLACK);
+    int y = 2;
+
+    // Title
+    fyCanvas.setTextSize(1);
+    fyCanvas.setTextColor(TFT_MAGENTA);
+    fyCanvas.setCursor(2, y);
+    fyCanvas.print("FLOCK-YOU INFO");
+    y += 12;
+    fyCanvas.drawFastHLine(0, y, 240, TFT_MAGENTA);
+    y += 6;
+
+    // WiFi AP info
+    bool companionActive = fyBLEClientConnected || fySerialHostConnected;
+    fyCanvas.setTextColor(TFT_WHITE);
+    fyCanvas.setCursor(2, y);
+    fyCanvas.printf("WiFi: %s / %s", FY_AP_SSID, FY_AP_PASS);
+    y += 12;
+    fyCanvas.setCursor(2, y);
+    fyCanvas.print("Dash: 192.168.4.1");
+    y += 12;
+    fyCanvas.setCursor(2, y);
+    if (companionActive) {
+        fyCanvas.setTextColor(TFT_CYAN);
+        fyCanvas.print("Mode: BLE Companion (WiFi OFF)");
+    } else {
+        fyCanvas.setTextColor(TFT_GREEN);
+        fyCanvas.print("Mode: Standalone (WiFi AP ON)");
+    }
+    y += 16;
+
+    // Stats
+    int ravenCount = 0, gpsCount = 0;
+    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        for (int i = 0; i < fyDetCount; i++) {
+            if (fyDet[i].isRaven) ravenCount++;
+            if (fyDet[i].hasGPS) gpsCount++;
+        }
+        xSemaphoreGive(fyMutex);
+    }
+    fyCanvas.setTextColor(TFT_WHITE);
+    fyCanvas.setCursor(2, y);
+    fyCanvas.printf("Detections: %d  Ravens: %d", fyDetCount, ravenCount);
+    y += 12;
+    fyCanvas.setCursor(2, y);
+    fyCanvas.printf("GPS tagged: %d", gpsCount);
+    y += 16;
+
+    // Volume
+    fyCanvas.setTextColor(TFT_WHITE);
+    fyCanvas.setCursor(2, y);
+    fyCanvas.printf("Volume: %d", fySpeakerVolume);
+    int volBars = (fySpeakerVolume + 50) / 51;
+    for (int b = 0; b < 5; b++) {
+        uint16_t c = (b < volBars) ? TFT_GREEN : 0x4208;
+        fyCanvas.fillRect(60 + b * 8, y, 6, 8, c);
+    }
+    y += 12;
+
+    // Battery
+    int batt = M5Cardputer.Power.getBatteryLevel();
+    fyCanvas.setTextColor(batt > 20 ? TFT_GREEN : TFT_RED);
+    fyCanvas.setCursor(2, y);
+    fyCanvas.printf("Battery: %d%%", batt);
+
+    // Footer
+    fyCanvas.drawFastHLine(0, 125, 240, 0x4208);
+    fyCanvas.setTextColor(0x4208);
+    fyCanvas.setCursor(2, 127);
+    fyCanvas.print("I:back  V:vol  M:mute");
 
     fyCanvas.pushSprite(0, 0);
 }
@@ -824,6 +1028,9 @@ static void fySaveSession() {
     f.close();
     fyLastSaveCount = fyDetCount;
     printf("[FLOCK-YOU] Session saved: %d detections\n", fyDetCount);
+#ifdef CARDPUTER_ADV
+    fyLastSaveFlash = millis();
+#endif
     xSemaphoreGive(fyMutex);
 }
 
@@ -1407,20 +1614,64 @@ void loop() {
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
         Keyboard_Class::KeysState state = M5Cardputer.Keyboard.keysState();
         for (auto key : state.word) {
+            // Navigation (mode-dependent)
             if (key == 'w' || key == 'W') {
-                if (fyDisplayScroll > 0) fyDisplayScroll--;
-                fyLastDisplayUpdate = 0;  // force redraw
-            }
-            if (key == 's' || key == 'S') {
-                int maxPages = (fyDetCount + FY_ROWS_PER_PAGE - 1) / FY_ROWS_PER_PAGE;
-                if (fyDisplayScroll < maxPages - 1) fyDisplayScroll++;
+                if (fyDisplayMode == 0) {
+                    if (fyDisplayScroll > 0) fyDisplayScroll--;
+                } else if (fyDisplayMode == 1) {
+                    if (fyDetailIndex > 0) fyDetailIndex--;
+                }
                 fyLastDisplayUpdate = 0;
             }
+            if (key == 's' || key == 'S') {
+                if (fyDisplayMode == 0) {
+                    int maxPages = (fyDetCount + FY_ROWS_PER_PAGE - 1) / FY_ROWS_PER_PAGE;
+                    if (fyDisplayScroll < maxPages - 1) fyDisplayScroll++;
+                } else if (fyDisplayMode == 1) {
+                    if (fyDetailIndex < fyDetCount - 1) fyDetailIndex++;
+                }
+                fyLastDisplayUpdate = 0;
+            }
+            // Detail view toggle (D or Enter)
+            if (key == 'd' || key == 'D' || key == '\r') {
+                if (fyDisplayMode == 1) {
+                    fyDisplayMode = 0;
+                } else if (fyDisplayMode == 0 && fyDetCount > 0) {
+                    fyDetailIndex = fyDetCount - 1 - (fyDisplayScroll * FY_ROWS_PER_PAGE);
+                    if (fyDetailIndex < 0) fyDetailIndex = 0;
+                    fyDisplayMode = 1;
+                }
+                fyLastDisplayUpdate = 0;
+            }
+            // Info view toggle (I)
+            if (key == 'i' || key == 'I') {
+                fyDisplayMode = (fyDisplayMode == 2) ? 0 : 2;
+                fyLastDisplayUpdate = 0;
+            }
+            // Back (Backspace)
+            if (key == 0x08) {
+                if (fyDisplayMode != 0) {
+                    fyDisplayMode = 0;
+                    fyLastDisplayUpdate = 0;
+                }
+            }
+            // Mute toggle (M) — all modes
             if (key == 'm' || key == 'M') {
                 fyBuzzerOn = !fyBuzzerOn;
                 fyLastDisplayUpdate = 0;
             }
-            if (key == 'c' || key == 'C') {
+            // Volume cycle (V)
+            if (key == 'v' || key == 'V') {
+                if (fySpeakerVolume < 100) fySpeakerVolume = 100;
+                else if (fySpeakerVolume < 150) fySpeakerVolume = 150;
+                else if (fySpeakerVolume < 200) fySpeakerVolume = 200;
+                else if (fySpeakerVolume < 255) fySpeakerVolume = 255;
+                else fySpeakerVolume = 50;
+                M5Cardputer.Speaker.setVolume(fySpeakerVolume);
+                fyLastDisplayUpdate = 0;
+            }
+            // Clear detections (C) — only from list view
+            if ((key == 'c' || key == 'C') && fyDisplayMode == 0) {
                 fySaveSession();
                 if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
                     fyDetCount = 0;
@@ -1435,10 +1686,28 @@ void loop() {
         }
     }
 
-    // LCD refresh
+    // LCD refresh (mode router)
     if (millis() - fyLastDisplayUpdate >= FY_DISPLAY_INTERVAL) {
-        fyUpdateDisplay();
+        switch (fyDisplayMode) {
+            case 1: fyDrawDetailView(); break;
+            case 2: fyDrawInfoView(); break;
+            default: fyUpdateDisplay(); break;
+        }
         fyLastDisplayUpdate = millis();
+    }
+
+    // Low battery warning
+    {
+        int batt = M5Cardputer.Power.getBatteryLevel();
+        if (batt <= 10 && fyLastBattWarning > 10) {
+            fyLastBattWarning = batt;
+            fyBeep(200, 500);
+        } else if (batt <= 20 && fyLastBattWarning > 20) {
+            fyLastBattWarning = batt;
+            fyBeep(400, 200);
+        } else if (batt > 20) {
+            fyLastBattWarning = batt;
+        }
     }
 #endif
 
